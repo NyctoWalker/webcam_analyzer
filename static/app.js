@@ -151,14 +151,110 @@
   refreshStatus();
 
   // Analytics tab
-  let currentRange = "24h";
+  let currentRange = "24h";  // preset short-code, or "custom"
+  let customStartISO = null;  // UTC ISO string when in custom mode
+  let customEndISO = null;
   let charts = {};
+
+  const customRangeBox = $("#customRange");
+  const customStartInput = $("#customStart");
+  const customEndInput   = $("#customEnd");
+  const customHint       = $("#customRangeHint");
+  const MAX_CUSTOM_SPAN_DAYS = 730;  // 2 years hard cap
+
+  // Format a Date as a value suitable for <input type="datetime-local">:
+  // "YYYY-MM-DDTHH:MM" in the browser's local timezone.
+  function toLocalDatetimeInputValue(d) {
+    const pad = (n) => String(n).padStart(2, "0");
+    return (
+      d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate())
+      + "T" + pad(d.getHours()) + ":" + pad(d.getMinutes())
+    );
+  }
+
+  // Set default custom-range values to "last 24h" the first time the user
+  // opens Custom mode - gives them something to edit instead of empty inputs.
+  function initCustomInputsIfNeeded() {
+    if (customStartInput.value) return;
+    const end = new Date();
+    const start = new Date(end.getTime() - 24 * 3600 * 1000);
+    customStartInput.value = toLocalDatetimeInputValue(start);
+    customEndInput.value   = toLocalDatetimeInputValue(end);
+  }
+
+  function setCustomHint(text, kind) {
+    customHint.textContent = text || "";
+    customHint.classList.remove("error", "ok");
+    if (kind) customHint.classList.add(kind);
+  }
 
   $$("#rangeButtons button").forEach((b) => {
     b.addEventListener("click", () => {
       $$("#rangeButtons button").forEach((x) => x.classList.toggle("active", x === b));
-      currentRange = b.dataset.range;
-      refreshAnalytics();
+      const range = b.dataset.range;
+      if (range === "custom") {
+        currentRange = "custom";
+        initCustomInputsIfNeeded();
+        customRangeBox.hidden = false;
+        // Don't refresh yet - wait for Apply. But if we already have a
+        // previously-applied custom range, refresh with it so the user
+        // sees the right data immediately.
+        if (customStartISO && customEndISO) {
+          refreshAnalytics();
+        } else {
+          setCustomHint("Pick start/end and press Apply", "");
+        }
+      } else {
+        currentRange = range;
+        customRangeBox.hidden = true;
+        setCustomHint("", "");
+        refreshAnalytics();
+      }
+    });
+  });
+
+  $("#btnApplyCustom").addEventListener("click", () => {
+    if (!customStartInput.value || !customEndInput.value) {
+      setCustomHint("Both start and end are required", "error");
+      return;
+    }
+    // datetime-local gives a naive local-time string. `new Date()` parses
+    // it as local time, then .toISOString() gives us a UTC ISO string that
+    // FastAPI can parse as a timezone-aware datetime.
+    const startD = new Date(customStartInput.value);
+    const endD   = new Date(customEndInput.value);
+    if (isNaN(startD.getTime()) || isNaN(endD.getTime())) {
+      setCustomHint("Invalid date format", "error");
+      return;
+    }
+    if (startD >= endD) {
+      setCustomHint("Start must be before end", "error");
+      return;
+    }
+    const spanDays = (endD - startD) / (86400 * 1000);
+    if (spanDays > MAX_CUSTOM_SPAN_DAYS) {
+      setCustomHint(
+        `Range too large: ${spanDays.toFixed(0)} days (max ${MAX_CUSTOM_SPAN_DAYS})`,
+        "error",
+      );
+      return;
+    }
+    customStartISO = startD.toISOString();
+    customEndISO   = endD.toISOString();
+    setCustomHint(
+      `Applied: ${startD.toLocaleString()} → ${endD.toLocaleString()}`,
+      "ok",
+    );
+    refreshAnalytics();
+  });
+
+  // Allow Enter key in either input to trigger Apply
+  [customStartInput, customEndInput].forEach((inp) => {
+    inp.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        $("#btnApplyCustom").click();
+      }
     });
   });
 
@@ -179,7 +275,20 @@
 
   async function refreshAnalytics() {
     const bucket = $("#bucketSelect").value;
-    const url = `/api/stats?range=${encodeURIComponent(currentRange)}&bucket=${encodeURIComponent(bucket)}`;
+    let url;
+    if (currentRange === "custom") {
+      if (!customStartISO || !customEndISO) {
+        // Custom mode but no range applied yet - show empty state
+        $("#analyticsEmpty").textContent = "Pick a custom start/end and press Apply.";
+        $("#analyticsEmpty").hidden = false;
+        return;
+      }
+      url = `/api/stats?start=${encodeURIComponent(customStartISO)}`
+          + `&end=${encodeURIComponent(customEndISO)}`
+          + `&bucket=${encodeURIComponent(bucket)}`;
+    } else {
+      url = `/api/stats?range=${encodeURIComponent(currentRange)}&bucket=${encodeURIComponent(bucket)}`;
+    }
     let data;
     try {
       data = await fetchJSON(url);

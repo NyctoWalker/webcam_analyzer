@@ -165,16 +165,25 @@ def auto_bucket(seconds: float) -> str:
         return "6 hours"
     if seconds <= 60 * 86400:  # <= 60d > 1 day
         return "1 day"
-    return "1 week"
+    if seconds <= 365 * 86400:  # <= 1 yr > 1 week
+        return "1 week"
+    return "30 days"  # > 1 yr > 30 days
 
 _BUCKET_RE = re.compile(
     r'^\s*(\d+)\s*(minute|minutes|hour|hours|day|days|week|weeks)\s*$',
     re.IGNORECASE,
 )
 
+# map shorthands to canonical interval strings.
+_BUCKET_ALIASES = {
+    "1 month": "30 days",
+    "months": "30 days",  # only used if someone manually types it
+}
 
 def bucket_to_timedelta(bucket: str) -> timedelta:
     """Convert a human-readable interval string like '30 minutes' or '1 hour' into a datetime.timedelta."""
+    # resolve aliases (like "1 month" > "30 days") before regex
+    bucket = _BUCKET_ALIASES.get(bucket, bucket)
     m = _BUCKET_RE.match(bucket)
     if not m:
         raise ValueError(

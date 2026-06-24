@@ -90,7 +90,19 @@
             <button data-range="24h" class="active">24H</button>
             <button data-range="7d">7D</button>
             <button data-range="30d">30D</button>
+            <button data-range="custom" id="btnCustomRange">Custom…</button>
           </div>
+        </div>
+
+        <div class="control-group custom-range" id="customRange" hidden>
+          <label>Custom range <small>(local time)</small></label>
+          <div class="custom-range-row">
+            <input type="datetime-local" id="customStart" />
+            <span class="arrow">→</span>
+            <input type="datetime-local" id="customEnd" />
+            <button id="btnApplyCustom" class="btn btn-secondary">Apply</button>
+          </div>
+          <div class="custom-range-hint" id="customRangeHint"></div>
         </div>
 
         <div class="control-group">
