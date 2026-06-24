@@ -248,6 +248,50 @@ main { padding: 24px; max-width: 1400px; margin: 0 auto; }
 .seg-buttons button:hover { color: var(--text); }
 .seg-buttons button.active { background: var(--accent-soft); color: var(--accent); }
 
+/* Custom date range */
+.custom-range {
+  flex-direction: column;
+  gap: 6px;
+}
+.custom-range label small {
+  color: var(--text-dim);
+  font-size: 10px;
+  font-weight: normal;
+  margin-left: 4px;
+}
+.custom-range-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.custom-range-row input[type="datetime-local"] {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 7px 10px;
+  font-size: 13px;
+  font-family: inherit;
+  font-variant-numeric: tabular-nums;
+  min-width: 200px;
+}
+.custom-range-row input[type="datetime-local"]:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.custom-range-row .arrow {
+  color: var(--text-dim);
+  font-size: 14px;
+}
+.custom-range-row .btn { flex: 0 0 auto; padding: 8px 14px; }
+.custom-range-hint {
+  font-size: 11px;
+  color: var(--text-dim);
+  min-height: 14px;
+}
+.custom-range-hint.error { color: var(--red); }
+.custom-range-hint.ok { color: var(--green); }
+
 select {
   background: var(--bg);
   color: var(--text);

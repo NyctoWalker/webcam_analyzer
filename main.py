@@ -173,7 +173,7 @@ async def api_stats(
     span_seconds = (end - start).total_seconds()
 
     ts = await db.get_timeseries(
-        AppState.pool, start=start, end=end, bucket=bucket_interval
+        AppState.pool, start=start, end=end, bucket=bucket_td
     )
     summary = await db.get_summary(AppState.pool, start=start, end=end)
 
@@ -300,5 +300,5 @@ def _placeholder_frame(text: str, hint: str = "") -> bytes | None:
 # CLI launch
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
     print("http://localhost:8000")
+    uvicorn.run("main:app", port=8000, reload=False)
