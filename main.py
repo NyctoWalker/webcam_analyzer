@@ -1,426 +1,304 @@
-import cv2
-import mediapipe as mp
-import time
-import threading
-from scipy.spatial import distance as dist
-import sounddevice as sd
-import numpy as np
-from collections import deque
-import math
-import os
+"""
+FastAPI app for webcam analyzer.
+
+Endpoints list
+GET  /              Single-page UI (live + analytics tabs)
+GET  /api/status    Live counters + analyzer running flag
+POST /api/start     Start analyzer thread
+POST /api/stop      Stop analyzer thread (flushes partial batch)
+GET  /api/stats     Aggregated stats - ?range=24h&bucket=auto or ?start=...&end=...&bucket=1 hour
+GET  /video/feed    MJPEG stream of latest annotated frame
+
+Run: python main.py
+or: uvicorn main:app --host 0.0.0.0 --port 8000
+"""
+
+from __future__ import annotations
+
 import asyncio
-import asyncpg
-from datetime import datetime, timezone
+import time
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+
+import db
+from analyzer import WebcamAnalyzer
 
 
-# Config
-BATCH_INTERVAL = 11  # DB write interval, sec
-DB_URL = os.environ.get(
-    "DATABASE_URL",
-    "postgresql://usr:secret@localhost:1984/webcam_stats",
-)
-
-cam = cv2.VideoCapture(0)
-FONT = cv2.FONT_HERSHEY_DUPLEX
-STAT_TEXT_COLOR = (0, 200, 0)
-METRICS_TEXT_COLOR = (0, 150, 255)
-
-# DEBUG
-DRAW_LANDMARKS = True
-SHOW_METRICS = True
-
-# audio
-SAMPLE_RATE = 16000
-BLOCK_SIZE = 8000  # 500ms of audio/callback
-
-class AudioState:
-    def __init__(self):
-        self.current_dBFS = 0.0  # instant value
-        self.batch_ms_sum = 0.0  # MS sum for avg
-        self.batch_ms_count = 0  # callbacks number
-        self.batch_max_dBFS = 0.0 # peak dBFS in current batch
-
-    def reset_batch(self):
-        self.batch_ms_sum = 0.0
-        self.batch_ms_count = 0
-        self.batch_max_dBFS = 0.0
-
-audio_state = AudioState()
-audio_lock = threading.Lock()
+BASE_DIR = Path(__file__).parent
+TEMPLATES = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 
-# microphone input thread
-def audio_callback(indata, frames, time_info, status):
-    if status:
-        print(f"Audio status: {status}")
-
-    ms = np.mean(indata ** 2)
-    rms = np.sqrt(ms)
-    dBFS = (20 * np.log10(rms) + 50) if rms > 0 else 0
-
-    with audio_lock:
-        audio_state.current_dBFS = dBFS
-        audio_state.batch_ms_sum += ms
-        audio_state.batch_ms_count += 1
-        if dBFS > audio_state.batch_max_dBFS:
-            audio_state.batch_max_dBFS = dBFS
+# app state. created in lifespan so analyzer+pool share running loop
+class AppState:
+    pool = None
+    analyzer: WebcamAnalyzer | None = None
 
 
-try:
-    audio_stream = sd.InputStream(
-        callback=audio_callback,
-        channels=1,
-        samplerate=SAMPLE_RATE,
-        blocksize=BLOCK_SIZE,
-    )
-    audio_stream.start()
-    mic_available = True
-except Exception as e:
-    print(f"Could not start microphone: {e}")
-    mic_available = False
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    loop = asyncio.get_running_loop()
+    try:
+        AppState.pool = await db.init_pool()
+    except Exception as e:
+        print(f"[startup] DB init failed - analyzer will keep retrying on flush: {e}")
+        AppState.pool = None
+    AppState.analyzer = WebcamAnalyzer(loop=loop, pool=AppState.pool)
+    yield
+
+    # shutdown
+    if AppState.analyzer:
+        AppState.analyzer.stop()
+    if AppState.pool:
+        await db.close_pool(AppState.pool)
 
 
-# face mesh
-mp_face_mesh = mp.solutions.face_mesh
-face_mesh = mp_face_mesh.FaceMesh(
-    max_num_faces=1,
-    refine_landmarks=True,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5,
-)
+app = FastAPI(title="Webcam Analyzer", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
 
-# EAR for blinking
-def calculate_EAR(eye):
-    v1 = dist.euclidean(eye[1], eye[5])
-    v2 = dist.euclidean(eye[2], eye[4])
-    h = dist.euclidean(eye[0], eye[3])
-    return (v1 + v2) / (2.0 * h) if h else 0.0
-
-# eye landmarks
-L_EYE = [33, 160, 158, 133, 153, 144]
-R_EYE = [362, 385, 387, 263, 373, 380]
-L_IRIS, R_IRIS = 468, 473
-
-# blink state
-BLINK_THRESH = 0.21
-BLINK_FRAMES = 2
-blink_counter = 0
-blink_count = 0
-
-# smile state
-SMILE_THRESH = 1
-SMILE_FRAMES = 5
-NON_SMILE_FRAMES = 5
-smile_frame_counter = 0
-non_smile_counter = 0
-is_smiling = False
-smile_start_time = None
-smile_count = 0
-total_smile_time = 0.0
+# pages
+@app.get("/", response_class=HTMLResponse)
+async def index(request: Request):
+    return TEMPLATES.TemplateResponse("index.html", {"request": request})
 
 
-# DB writing using asyncpg and separate event loop thread. in some way my practice of asyncpg instead of psycopg.
-db_loop = asyncio.new_event_loop()
-db_thread = threading.Thread(target=lambda: db_loop.run_forever(), daemon=True)
-db_thread.start()
-
-async_pool = None
-db_available = False
-
-
-async def _init_pool():
-    global async_pool, db_available
-    async_pool = await asyncpg.create_pool(DB_URL, min_size=1, max_size=3)
-    async with async_pool.acquire() as conn:
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS stats_batch (
-                id              SERIAL PRIMARY KEY,
-                batch_start     TIMESTAMPTZ NOT NULL,
-                batch_end       TIMESTAMPTZ NOT NULL,
-                duration_s      DOUBLE PRECISION NOT NULL,
-                blink_count     INTEGER NOT NULL DEFAULT 0,
-                smile_count     INTEGER NOT NULL DEFAULT 0,
-                smile_time_s    DOUBLE PRECISION NOT NULL DEFAULT 0,
-                avg_loudness    DOUBLE PRECISION,
-                max_loudness    DOUBLE PRECISION
-            );
-            
-            CREATE INDEX IF NOT EXISTS idx_stats_batch_start ON stats_batch (batch_start);
-        """)
-    db_available = True
-    print("Database ready.")
+# control+status API
+@app.post("/api/start")
+async def api_start():
+    if AppState.analyzer is None:
+        raise HTTPException(503, "Analyzer not initialized")
+    if not AppState.pool:
+        # try to (re)create pool lazily so UI works even if DB was down at boot
+        try:
+            AppState.pool = await db.init_pool()
+            AppState.analyzer._pool = AppState.pool
+        except Exception as e:
+            raise HTTPException(503, f"Database unavailable: {e}")
+    started = AppState.analyzer.start()
+    return {"started": started, "running": AppState.analyzer.is_running()}
 
 
-def _run_async(coro):
-    """Submit a coroutine to the background loop and block until it returns."""
-    future = asyncio.run_coroutine_threadsafe(coro, db_loop)
-    return future.result(timeout=10)
+@app.post("/api/stop")
+async def api_stop():
+    if AppState.analyzer:
+        AppState.analyzer.stop()
+        return {"stopped": True, "running": AppState.analyzer.is_running()}
+    return {"stopped": False, "running": False}
 
 
-# Initialise pool (retry on each batch flush if it fails)
-try:
-    _run_async(_init_pool())
-except Exception as e:
-    print(f"DB pool init failed (will retry on first flush): {e}")
+@app.get("/api/status")
+async def api_status():
+    if AppState.analyzer is None:
+        return {"running": False, "db_ready": bool(AppState.pool)}
+    state = AppState.analyzer.get_live_state()
+    state["db_ready"] = bool(AppState.pool)
+    return state
 
 
-async def _ensure_pool():
-    """Reconnect if the pool was never created or is closed."""
-    global async_pool, db_available
-    if async_pool is not None and not async_pool._closed:
-        return
-    await _init_pool()
+# stats / analytics API
+RANGE_PRESETS = {
+    "1h":  3600,
+    "24h": 24 * 3600,
+    "7d":  7 * 86400,
+    "30d": 30 * 86400,
+}
+
+BUCKET_PRESETS = {
+    "1m": "1 minute",
+    "5m": "5 minutes",
+    "30m": "30 minutes",
+    "1h": "1 hour",
+    "6h": "6 hours",
+    "1d": "1 day",
+}
 
 
-async def _insert_batch(batch_start, batch_end, duration, blinks, smiles, smile_time, avg_loud, max_loud):
-    await _ensure_pool()
-    async with async_pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO stats_batch
-                (batch_start, batch_end, duration_s,
-                 blink_count, smile_count, smile_time_s,
-                 avg_loudness, max_loudness)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-            """,
-            batch_start, batch_end, duration,
-            blinks, smiles, smile_time, avg_loud, max_loud,
+@app.get("/api/stats")
+async def api_stats(
+    range: str | None = Query(None, description="Preset: 1h | 24h | 7d | 30d"),
+    start: datetime | None = Query(None, description="ISO start (overrides range)"),
+    end: datetime | None = Query(None, description="ISO end (overrides range)"),
+    bucket: str = Query("auto", description="auto | 1m | 5m | 30m | 1h | 6h | 1d"),
+):
+    # resolve bucket
+    if bucket == "auto":
+        now_for_bucket = datetime.now(tz=timezone.utc)
+        if start and end:
+            s_tmp = start.astimezone(timezone.utc) if start.tzinfo else start.replace(tzinfo=timezone.utc)
+            e_tmp = end.astimezone(timezone.utc) if end.tzinfo else end.replace(tzinfo=timezone.utc)
+        elif range and range in RANGE_PRESETS:
+            e_tmp = now_for_bucket
+            s_tmp = now_for_bucket - timedelta(seconds=RANGE_PRESETS[range])
+        else:
+            e_tmp = now_for_bucket
+            s_tmp = now_for_bucket - timedelta(seconds=RANGE_PRESETS["24h"])
+        bucket_interval = db.auto_bucket((e_tmp - s_tmp).total_seconds())
+    elif bucket in BUCKET_PRESETS:
+        bucket_interval = BUCKET_PRESETS[bucket]
+    else:
+        raise HTTPException(
+            400,
+            f"Invalid bucket={bucket!r}. Use 'auto' or one of: "
+            f"{', '.join(sorted(BUCKET_PRESETS.keys()))}",
         )
 
-
-def insert_batch_sync(batch_start, batch_end, duration, blinks, smiles, smile_time, avg_loud, max_loud):
-    if not db_available and async_pool is None:
-        try:
-            _run_async(_ensure_pool())
-        except Exception as e:
-            print(f"DB still unreachable: {e}")
-            return
+    # сonvert to timedelta
     try:
-        _run_async(_insert_batch(
-            batch_start, batch_end, duration, blinks,
-            smiles, smile_time, avg_loud, max_loud,
-        ))
-    except Exception as e:
-        print(f"DB insert error: {e}")
+        bucket_td = db.bucket_to_timedelta(bucket_interval)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
+    if AppState.pool is None:
+        raise HTTPException(503, "Database unavailable")
 
-# working with batches
-batch_start_time = time.time()
-
-
-def flush_batch():
-    """Snapshot counters > DB > reset for next batch. """
-    global blink_count, smile_count, total_smile_time
-    global smile_start_time, batch_start_time
-
-    now = time.time()
-    duration = now - batch_start_time
-
-    # blink
-    batch_blinks = blink_count
-    blink_count = 0
-
-    # smile
-    batch_smile_time = total_smile_time
-    if is_smiling and smile_start_time is not None:
-        batch_smile_time += now - smile_start_time
-        smile_start_time = now
-
-    batch_smiles = smile_count
-    smile_count = 0
-    total_smile_time = 0.0
-
-    # audio
-    if mic_available:
-        with audio_lock:
-            ms_sum = audio_state.batch_ms_sum
-            ms_cnt = audio_state.batch_ms_count
-            mx_dB = audio_state.batch_max_dBFS
-            audio_state.reset_batch()
-
-        if ms_cnt > 0 and ms_sum > 0:
-            avg_rms = np.sqrt(ms_sum / ms_cnt)
-            avg_dB = (20 * np.log10(avg_rms) + 50) if avg_rms > 0 else 0.0
-        elif ms_cnt > 0:
-            avg_dB = 0.0  # silence
-        else:
-            avg_dB = None  # no callbacks
-            mx_dB = None
+    # resolve window
+    now = datetime.now(tz=timezone.utc)
+    if start and end:
+        start = start.astimezone(timezone.utc) if start.tzinfo else start.replace(tzinfo=timezone.utc)
+        end = end.astimezone(timezone.utc) if end.tzinfo else end.replace(tzinfo=timezone.utc)
+    elif range and range in RANGE_PRESETS:
+        end = now
+        start = now - timedelta(seconds=RANGE_PRESETS[range])
     else:
-        avg_dB = None
-        mx_dB = None
+        # default to last 24h
+        end = now
+        start = now - timedelta(seconds=RANGE_PRESETS["24h"])
 
-    # writing
-    insert_batch_sync(
-        batch_start=datetime.fromtimestamp(batch_start_time, tz=timezone.utc),
-        batch_end=datetime.fromtimestamp(now, tz=timezone.utc),
-        duration=duration,
-        blinks=batch_blinks,
-        smiles=batch_smiles,
-        smile_time=batch_smile_time,
-        avg_loud=avg_dB,
-        max_loud=mx_dB,
+    span_seconds = (end - start).total_seconds()
+
+    ts = await db.get_timeseries(
+        AppState.pool, start=start, end=end, bucket=bucket_interval
     )
+    summary = await db.get_summary(AppState.pool, start=start, end=end)
 
-    print(
-        f"[Batch] {duration:.1f}s | blinks={batch_blinks} | "
-        f"smiles={batch_smiles} | smile_t={batch_smile_time:.2f}s | "
-        f"avg_dB={avg_dB} | max_dB={mx_dB}"
-    )
+    return JSONResponse({
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "bucket": bucket_interval,
+        "bucket_label": bucket if bucket != "auto" else f"auto ({bucket_interval})",
+        "summary": summary,
+        "timeseries": ts,
+    })
 
-    batch_start_time = now
 
-while True:
-    ret, frame = cam.read()
-    if not ret:
-        break
+# Settings (HUD overlay + video display toggles)
+from pydantic import BaseModel
 
-    frame = cv2.resize(frame, (640, 480))
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = face_mesh.process(rgb)
 
-    smile_metric = 0.0
-    avg_EAR = 0.0
+class SettingsUpdate(BaseModel):
+    overlay: bool | None = None
+    display: bool | None = None
 
-    if results.multi_face_landmarks:
-        for fl in results.multi_face_landmarks:
-            h, w = frame.shape[:2]
 
-            def pt(i):
-                return (fl.landmark[i].x * w, fl.landmark[i].y * h)
+@app.get("/api/settings")
+async def api_get_settings():
+    if AppState.analyzer is None:
+        return {"overlay": True, "display": True}
+    return {
+        "overlay": AppState.analyzer.overlay_enabled,
+        "display": AppState.analyzer.display_enabled,
+    }
 
-            # blink
-            left_eye = [pt(i) for i in L_EYE]
-            right_eye = [pt(i) for i in R_EYE]
-            avg_EAR = (calculate_EAR(left_eye) + calculate_EAR(right_eye)) / 2.0
 
-            if avg_EAR < BLINK_THRESH:
-                blink_counter += 1
+@app.post("/api/settings")
+async def api_set_settings(s: SettingsUpdate):
+    if AppState.analyzer is None:
+        raise HTTPException(503, "Analyzer not initialized")
+    if s.overlay is not None:
+        AppState.analyzer.overlay_enabled = s.overlay
+    if s.display is not None:
+        AppState.analyzer.display_enabled = s.display
+    return {
+        "overlay": AppState.analyzer.overlay_enabled,
+        "display": AppState.analyzer.display_enabled,
+    }
+
+
+# MJPEG video feed
+@app.get("/video/feed")
+async def video_feed():
+    boundary = "frame"
+
+    async def generate():
+        # send placeholder frame when analyzer is off
+        last_placeholder_at = 0.0
+        last_placeholder_text = ""
+        while True:
+            if AppState.analyzer is None:
+                await asyncio.sleep(0.5)
+                continue
+
+            # decide what placeholder text to show when there's no JPEG.
+            if not AppState.analyzer.display_enabled:
+                placeholder_text = "Video display is off"
+                placeholder_hint = "Stats still collecting - enable Display to see feed"
+            elif not AppState.analyzer.is_running():
+                placeholder_text = "Analyzer is stopped"
+                placeholder_hint = "Click Start to begin"
             else:
-                if blink_counter >= BLINK_FRAMES:
-                    blink_count += 1
-                blink_counter = 0
+                placeholder_text = ""
+                placeholder_hint = ""
 
-            # smile
-            l_corner = pt(61)
-            r_corner = pt(291)
-            upper_lip = pt(13)
-            lower_lip = pt(14)
-            l_iris = pt(L_IRIS)
-            r_iris = pt(R_IRIS)
+            jpeg = AppState.analyzer.get_jpeg_frame()
+            if jpeg is None:
+                # throttle placeholder frames to ~1 fps and only re-encode if text changed.
+                now = time.time()
+                if (
+                    placeholder_text
+                    and (now - last_placeholder_at >= 1.0
+                    or last_placeholder_text != placeholder_text)
+                ):
+                    placeholder = _placeholder_frame(placeholder_text, placeholder_hint)
+                    if placeholder is not None:
+                        yield (
+                            b"--" + boundary.encode()
+                            + b"\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                            + str(len(placeholder)).encode()
+                            + b"\r\n\r\n" + placeholder + b"\r\n"
+                        )
+                    last_placeholder_at = now
+                    last_placeholder_text = placeholder_text
+                await asyncio.sleep(0.5)
+                continue
 
-            pupil_dist = dist.euclidean(l_iris, r_iris)
-            mouth_width = dist.euclidean(l_corner, r_corner)
+            yield (
+                b"--" + boundary.encode()
+                + b"\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                + str(len(jpeg)).encode()
+                + b"\r\n\r\n" + jpeg + b"\r\n"
+            )
+            # ~20 fps cap to keep CPU / bandwidth reasonable
+            await asyncio.sleep(0.05)
 
-            # width
-            width_ratio = mouth_width / pupil_dist if pupil_dist else 0.0
-
-            # corner elevation
-            center_y = (upper_lip[1] + lower_lip[1]) / 2.0
-            elev_l = center_y - l_corner[1]
-            elev_r = center_y - r_corner[1]
-            avg_elevation = (elev_l + elev_r) / 2.0
-            elevation_ratio = avg_elevation / pupil_dist if pupil_dist else 0.0
-
-            # "magic" combined metric
-            smile_metric = width_ratio + (elevation_ratio * 2.0)
-
-            # DEBUG
-            if DRAW_LANDMARKS:
-                for idx in L_EYE + R_EYE + [61, 291, 13, 14]:
-                    px = int(fl.landmark[idx].x * w)
-                    py = int(fl.landmark[idx].y * h)
-                    cv2.circle(frame, (px, py), 2, (0, 255, 0), -1)
-                for idx in (L_IRIS, R_IRIS):
-                    px = int(fl.landmark[idx].x * w)
-                    py = int(fl.landmark[idx].y * h)
-                    cv2.circle(frame, (px, py), 2, (255, 200, 0), -1)
-
-    # smile state machine
-    if smile_metric > SMILE_THRESH:
-        smile_frame_counter += 1
-        non_smile_counter = 0
-    else:
-        smile_frame_counter = 0
-        non_smile_counter += 1
-
-    if not is_smiling and smile_frame_counter >= SMILE_FRAMES:
-        is_smiling = True
-        smile_count += 1
-        smile_start_time = time.time()
-
-    if is_smiling and non_smile_counter >= NON_SMILE_FRAMES:
-        is_smiling = False
-        if smile_start_time is not None:
-            total_smile_time += time.time() - smile_start_time
-            smile_start_time = None
-
-    # smile time for the current batch
-    live_smile_time = total_smile_time
-    if is_smiling and smile_start_time is not None:
-        live_smile_time += time.time() - smile_start_time
-
-    # flushing batch
-    if time.time() - batch_start_time >= BATCH_INTERVAL:
-        flush_batch()
-
-    # audio stats display
-    disp_avg_dB = 0.0
-    disp_max_dB = 0.0
-    if mic_available:
-        with audio_lock:
-            ms_sum = audio_state.batch_ms_sum
-            ms_cnt = audio_state.batch_ms_count
-            disp_max_dB = audio_state.batch_max_dBFS
-
-        if ms_cnt > 0 and ms_sum > 0:
-            avg_rms = np.sqrt(ms_sum / ms_cnt)
-            disp_avg_dB = (20 * np.log10(avg_rms) + 50) if avg_rms > 0 else 0.0
-        else:
-            disp_avg_dB = 0.0
-
-    # text
-    cv2.putText(frame, f'Blink count: {blink_count}', (30, 30), FONT, 1, STAT_TEXT_COLOR, 2)
-    cv2.putText(frame, f'Smile count: {smile_count}', (30, 60), FONT, 1, STAT_TEXT_COLOR, 2)
-    cv2.putText(frame, f'Smile time: {live_smile_time:.2f} s', (30, 90),  FONT, 1, STAT_TEXT_COLOR, 2)
-
-    if mic_available:
-        cv2.putText(frame, f'Max Loudness: {disp_max_dB:.1f} dBFS', (30, 200), FONT, 1, STAT_TEXT_COLOR, 2)
-        cv2.putText(frame, f'Avg Loudness ({BATCH_INTERVAL}s): {disp_avg_dB:.1f} dBFS', (30, 230), FONT, 1, STAT_TEXT_COLOR, 2)
-
-    if SHOW_METRICS and results.multi_face_landmarks:
-        cv2.putText(frame, f'EAR: {avg_EAR:.2f}', (30, 120), FONT, 0.75, METRICS_TEXT_COLOR, 2)
-        cv2.putText(frame, f'Smile custom metric: {smile_metric:.2f}', (30, 140), FONT, 0.75, METRICS_TEXT_COLOR, 2)
-
-    remaining = max(0, BATCH_INTERVAL - (time.time() - batch_start_time))
-    cv2.putText(frame, f'Next batch: {remaining:.0f}s', (30, 260), FONT, 0.7, (200, 200, 200), 1)
-
-    cv2.imshow("Camera", frame)
-    if cv2.waitKey(5) & 0xFF == ord('q'):
-        break
-
-# clean up
-flush_batch()  # write partial batch
-
-cam.release()
-
-if mic_available:
-    audio_stream.stop()
-    audio_stream.close()
+    return StreamingResponse(
+        generate(),
+        media_type="multipart/x-mixed-replace; boundary=" + boundary,
+    )
 
 
-async def _close_pool():
-    if async_pool and not async_pool._closed:
-        await async_pool.close()
-
-
-if db_available:
+def _placeholder_frame(text: str, hint: str = "") -> bytes | None:
+    """generate small JPEG with given text"""
     try:
-        _run_async(_close_pool())
+        import cv2
+        import numpy as np
+        img = np.zeros((480, 640, 3), dtype=np.uint8)
+        cv2.putText(img, text, (80, 230), cv2.FONT_HERSHEY_DUPLEX, 1.2, (210, 210, 210), 2)
+        if hint:
+            cv2.putText(img, hint, (90, 280), cv2.FONT_HERSHEY_DUPLEX, 0.85, (130, 130, 130), 1)
+        ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+        return buf.tobytes() if ok else None
     except Exception:
-        pass
+        return None
 
 
-db_loop.call_soon_threadsafe(db_loop.stop)
-cv2.destroyAllWindows()
+# CLI launch
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
+    print("http://localhost:8000")

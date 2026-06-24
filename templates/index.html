@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Webcam Analyzer</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <!-- Chart.js from CDN; fetched once and cached by the browser -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo-dot"></span>
+      <h1>Webcam Analyzer</h1>
+    </div>
+    <nav class="tabs">
+      <button class="tab active" data-tab="live">Live</button>
+      <button class="tab" data-tab="analytics">Analytics</button>
+    </nav>
+    <div class="status-pill" id="statusPill">
+      <span class="dot" id="statusDot"></span>
+      <span id="statusText">Idle</span>
+    </div>
+  </header>
+
+  <main>
+    <!-- LIVE TAB -->
+    <section id="tab-live" class="tab-panel active">
+      <div class="live-grid">
+        <div class="video-wrap">
+          <img id="videoFeed" src="/video/feed" alt="Video feed" />
+          <div class="video-overlay" id="videoOverlay"></div>
+        </div>
+
+        <aside class="live-controls">
+          <div class="control-row">
+            <button id="btnStart" class="btn btn-primary">Start</button>
+            <button id="btnStop"  class="btn btn-danger" disabled>Stop</button>
+          </div>
+
+          <div class="toggles">
+            <label class="toggle">
+              <input type="checkbox" id="toggleOverlay" checked />
+              <span>HUD overlay</span>
+            </label>
+            <label class="toggle">
+              <input type="checkbox" id="toggleDisplay" checked />
+              <span>Video display</span>
+              <small class="toggle-hint">off = stats only, saves CPU</small>
+            </label>
+          </div>
+
+          <div class="stat-card">
+            <div class="stat-label">Blinks (this session)</div>
+            <div class="stat-value" id="liveBlinks">0</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Smiles (this session)</div>
+            <div class="stat-value" id="liveSmiles">0</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Smile time</div>
+            <div class="stat-value" id="liveSmileTime">0.00 s</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Next batch in</div>
+            <div class="stat-value" id="liveBatchRemaining">-- s</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Frames processed</div>
+            <div class="stat-value" id="liveFrames">0</div>
+          </div>
+
+          <div class="hint" id="liveHint">
+            Press Start to begin capturing. Batches are written to the database
+            every 11 seconds.
+          </div>
+        </aside>
+      </div>
+    </section>
+
+    <!-- ANALYTICS TAB -->
+    <section id="tab-analytics" class="tab-panel">
+      <div class="analytics-controls">
+        <div class="control-group">
+          <label>Range</label>
+          <div class="seg-buttons" id="rangeButtons">
+            <button data-range="1h">1H</button>
+            <button data-range="24h" class="active">24H</button>
+            <button data-range="7d">7D</button>
+            <button data-range="30d">30D</button>
+          </div>
+        </div>
+
+        <div class="control-group">
+          <label for="bucketSelect">Bucket</label>
+          <select id="bucketSelect">
+            <option value="auto" selected>Auto</option>
+            <option value="1m">1 min</option>
+            <option value="5m">5 min</option>
+            <option value="30m">30 min</option>
+            <option value="1h">1 hour</option>
+            <option value="6h">6 hours</option>
+            <option value="1d">1 day</option>
+          </select>
+        </div>
+
+        <div class="control-group">
+          <label>&nbsp;</label>
+          <button id="btnRefresh" class="btn btn-secondary">Refresh</button>
+        </div>
+
+        <div class="control-group">
+          <label class="checkbox">
+            <input type="checkbox" id="autoRefresh" />
+            <span>Auto-refresh (30s)</span>
+          </label>
+        </div>
+      </div>
+
+      <div class="summary-grid" id="summaryGrid">
+        <!-- filled by JS -->
+      </div>
+
+      <div class="charts-grid">
+        <div class="chart-card">
+          <div class="chart-header">
+            <h3>Blinks per bucket</h3>
+            <span class="chart-meta" id="metaBlinks"></span>
+          </div>
+          <canvas id="chartBlinks"></canvas>
+        </div>
+        <div class="chart-card">
+          <div class="chart-header">
+            <h3>Smiles per bucket</h3>
+            <span class="chart-meta" id="metaSmiles"></span>
+          </div>
+          <canvas id="chartSmiles"></canvas>
+        </div>
+        <div class="chart-card">
+          <div class="chart-header">
+            <h3>Smile time (seconds)</h3>
+            <span class="chart-meta" id="metaSmileTime"></span>
+          </div>
+          <canvas id="chartSmileTime"></canvas>
+        </div>
+        <div class="chart-card">
+          <div class="chart-header">
+            <h3>Loudness (dBFS)</h3>
+            <span class="chart-meta" id="metaLoud"></span>
+          </div>
+          <canvas id="chartLoud"></canvas>
+        </div>
+      </div>
+
+      <div class="empty-state" id="analyticsEmpty" hidden>
+        No data yet for this range. Start the analyzer, wait a few batches, then refresh.
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
