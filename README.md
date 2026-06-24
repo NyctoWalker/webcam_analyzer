@@ -1,8 +1,17 @@
-# webcam_analyzer
-simple stats available from PC with webcam&mic
+# Анализ статистики вебкамеры и микрофона
 
-- 1. Install Python deps (in a venv)
-`pip install -r requirements.txt`
+Личный проект для практики работы с Docker Compose, SQL Alchemy+asyncpg и FastAPI.
+
+Собирает статистику - с вебкамеры количество морганий, улыбок и время улыбки. С микрофона - громкость. Статистика 
+собирается в базу данных в контейнере PostgreSQL и в будущем может использоваться для построения графики в веб-интерфейсе.
+Стоит отметить, что фронтенд по большей части написан с помощью LLM, это не моя область экспертизы как разработчика.
+
+# Установка и запуск
+
+- 1. Установите зависимости
+`Python
+pip install -r requirements.txt
+`
 
 - 2. Start PostgreSQL
 `docker compose up -d`
